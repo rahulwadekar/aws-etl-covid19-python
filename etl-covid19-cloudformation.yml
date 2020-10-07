@@ -1,0 +1,259 @@
+Parameters:
+  DBInstanceClass:
+    Type: String
+    Default: "db.t2.micro"
+  DatabaseName:
+      Type: String
+      Default: "covid19_database"
+  DBMasterUsername:
+    Type: String
+    Default: "{{resolve:ssm:/covid19_database/db_username:1}}"
+  DBMasterPassword:
+    Type: String
+    Default: "{{resolve:ssm-secure:/covid19_database/db_password:1}}"
+    NoEcho: True
+  RepositoryBranch:
+    Type: String
+    Default: master
+Resources: 
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: lambda_function.lambda_handler
+      Runtime: python3.8
+      Role: !GetAtt LambdaExecutionRole.Arn
+      MemorySize: 256
+      Timeout: 60
+      Code: lambdacode/
+      Environment:
+        Variables: 
+          db_name: !Ref DatabaseName
+          db_host: !GetAtt PostgresDB.Endpoint.Address
+          sns_topic: !Ref SNSTopicCloudGuruChallenge
+      Layers:
+        - !Ref PythonLayers
+    DependsOn:
+      - LambdaExecutionRole
+      - PythonLayers
+      - SNSTopicCloudGuruChallenge
+  PythonLayers:
+    Type: "AWS::Lambda::LayerVersion"
+    Properties:
+        CompatibleRuntimes:
+            - "python3.8"
+        Content:
+            S3Bucket: "python-layers-rahul"
+            S3Key: "pandas_psycopg2.zip"
+        Description: "Python dependency layers"
+        LayerName: "cloud-guru-challenge-python-layer"
+  ScheduledRule: 
+    Type: AWS::Events::Rule
+    Properties: 
+      ScheduleExpression: "rate(10 minutes)"
+      State: "ENABLED"
+      Targets: 
+        - Arn: !GetAtt LambdaFunction.Arn
+          Id: "TargetFunction" 
+  InvokeLambdaPermission: 
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: !GetAtt LambdaFunction.Arn
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt ScheduledRule.Arn
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: allow-logs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:*'
+                Resource: arn:aws:logs:*:*:*
+        - PolicyName: allow-dynamodb-put
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'dynamodb:PutItem'
+                Resource: arn:aws:dynamodb:*:399751603570:table/covid19-data
+        - PolicyName: allow-publish-sns
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'SNS:Publish'
+                Resource: '*'
+        - PolicyName: allow-s3-putobject
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:PutObject'
+                Resource: arn:aws:s3:::cloud-guru-challenge-etl-lambda-code-rahul
+        - PolicyName: allow-ssm-GetParameters
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'ssm:GetParameter'
+                Resource: 
+                  - arn:aws:ssm:us-east-1:399751603570:parameter/covid19_database/db_username              
+                  - arn:aws:ssm:us-east-1:399751603570:parameter/covid19_database/db_password              
+  PostgresDB:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      AllocatedStorage: 5
+      DBName: "covid19_database"
+      DBInstanceClass: !Ref DBInstanceClass
+      DBSecurityGroups: 
+        - !Ref PostgresDBSecurityGroup
+      Engine: postgres
+      MasterUsername: !Ref DBMasterUsername
+      MasterUserPassword: !Ref DBMasterPassword
+      MaxAllocatedStorage: 5
+      MultiAZ: false  
+    DependsOn:
+      - ETLCovid19Pipeline 
+  PostgresDBSecurityGroup:
+    Type: AWS::RDS::DBSecurityGroup
+    Properties:
+      DBSecurityGroupIngress:
+        CIDRIP: 0.0.0.0/0
+      GroupDescription: "Security group for Postgres database instance"
+  SNSSubscriptionCloudGuruChallenge:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Endpoint: "rahul.dw@gmail.com"
+      Protocol: email
+      TopicArn: !Ref SNSTopicCloudGuruChallenge
+    DependsOn:
+      - SNSTopicCloudGuruChallenge     
+  SNSTopicCloudGuruChallenge:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: "SNS-Topic-Cloud-Guru-Challenge"
+  ArtifactStoreBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+      AccessControl: BucketOwnerFullControl
+  ETLCovid19Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      RoleArn: !GetAtt [CodePipelineRole, Arn]
+      ArtifactStore:
+        Location:
+          Ref:
+            ArtifactStoreBucket
+        Type: S3
+      Stages:
+        - Name: Source
+          Actions:
+            - InputArtifacts: []
+              Name: Source
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Version: 1
+                Provider: CodeCommit
+              OutputArtifacts:
+                - Name: ETL-Covid19-Source
+              Configuration:
+                BranchName: !Ref RepositoryBranch
+                RepositoryName: !Ref AWS::StackName
+              RunOrder: 1
+        - Name: Build
+          Actions:
+          - Name: Build
+            ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Version: 1
+                Provider: CodeBuild
+            OutputArtifacts:
+              - Name: ETL-Covid19-Packaged-Output
+            InputArtifacts:
+              - Name: ETL-Covid19-Source
+            Configuration:
+                ProjectName: !Ref CodeBuildETLCovid19PythonProject
+            RunOrder: 1
+        - Name: Deploy
+          Actions:
+          - Name: Deploy-ETL-Covid19-App
+            ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Version: 1
+                Provider: CloudFormation
+            InputArtifacts:
+              - Name: ETL-Covid19-Packaged-Output
+            Configuration:
+              ActionMode: CREATE_UPDATE 
+              StackName: !Ref AWS::StackName
+              TemplatePath: 'ETL-Covid19-Packaged-Output::output.yml'
+              Capabilities: CAPABILITY_IAM
+              RoleArn: arn:aws:iam::399751603570:role/CloudFormationFullAccess
+  CodePipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          Effect: Allow
+          Principal:
+            Service: codepipeline.amazonaws.com
+          Action: sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess
+  CodeBuildETLCovid19PythonProject:
+    Type: AWS::CodeBuild::Project
+    DependsOn: CodeBuildRole
+    Properties:
+      Artifacts:
+        Type: no_artifacts
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:4.0
+        Type: LINUX_CONTAINER
+      Name: !Sub ${AWS::StackName}CodeBuildETLCovid19PythonProject
+      ServiceRole: !Ref CodeBuildRole
+      Source:
+        Type: CODECOMMIT
+        Location:
+          Fn::Join:
+            - ""
+            - - "https://git-codecommit."
+              - Ref: AWS::Region
+              - ".amazonaws.com/v1/repos/"
+              - Ref: AWS::StackName
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          Effect: Allow
+          Principal:
+            Service: codebuild.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess

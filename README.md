@@ -1,5 +1,4 @@
 Event-Driven Python on AWS- #CloudGuruChallenge
-Automate an ETL processing CI/CD pipeline for COVID-19 data using Python and cloud services.
 
 What is the Challenge?
 
